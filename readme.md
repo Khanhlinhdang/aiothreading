@@ -145,7 +145,6 @@ examples of when you would do this would be when running a health check on the d
 If none of these fit your criteria I highly encourage you to use the aiomultiprocessing library, it's way faster and has smarter exiting techniques.
 
 ## TODOS
+- [ ] add aiologic to fix responsiveness of some threads to fix speeds and performance.
 - [ ] Youtube Video about how to use
-- [x] Pypi pakage
-- [x] workflows 
 
