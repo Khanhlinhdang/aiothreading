@@ -17,6 +17,8 @@ WARNING
 All of the following listed above are Currently Experimental and all 
 are held subject to change in the near futrue.
 
+NOTE: Some Parts of this module will soon be deprecated in Favor of aiologic
+SEE: https://github.com/x42005e1f/aiologic
 """
 
 
