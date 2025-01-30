@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import traceback
+
 from typing import (
     Any,
     AsyncIterable,
@@ -20,21 +21,35 @@ from typing import (
     TypeVar,
 )
 
+from .core import Thread, get_context
+from .scheduler import RoundRobin, Scheduler
+from .types import (
+    LoopInitializer,
+    PoolTask,
+    ProxyException,
+    QueueID,
+    R,
+    T,
+    TaskID,
+    TracebackStr,
+)
 
+from aiologic import SimpleQueue
+
+MAX_TASKS_PER_CHILD = 0  # number of tasks to execute before recycling a child process
+CHILD_CONCURRENCY = 16  # number of tasks to execute simultaneously per child process
 _T = TypeVar("_T")
+
 log = logging.getLogger(__name__)
 
-Future = asyncio.Future
-
-from aiologic import Queue, QueueEmpty
 
 class ThreadPoolWorker(Thread):
     """Individual worker thread for the async pool."""
 
     def __init__(
         self,
-        tx: Queue,
-        rx: Queue,
+        tx: SimpleQueue,
+        rx: SimpleQueue,
         ttl: int = MAX_TASKS_PER_CHILD,
         concurrency: int = CHILD_CONCURRENCY,
         *,
@@ -52,19 +67,19 @@ class ThreadPoolWorker(Thread):
         self.concurrency = max(1, concurrency)
         self.exception_handler = exception_handler
         self.ttl = max(0, ttl)
-        self.tx: Queue[Optional[PoolTask]] = tx
+        self.tx = tx
         self.rx = rx
-    
-    async def run(self):
+
+    async def run(self) -> None:
+        """Pick up work, execute work, return results, rinse, repeat."""
         pending: Dict[asyncio.Future, TaskID] = {}
         completed = 0
-        running = True
+        
 
-        loop = asyncio.get_event_loop()
-        finished = asyncio.Event()
+        # Changes Were Suggested by x42005e1f
+        # SEE: https://github.com/Vizonex/aiothreading/issues/1#issuecomment-2623569854
 
         def _on_completed(f: asyncio.Future):
-            # Making all of these nonlocal fixes issues...
             nonlocal completed
             nonlocal pending
 
@@ -83,52 +98,27 @@ class ThreadPoolWorker(Thread):
             self.rx.put_nowait((tid, result, tb))
             completed += 1
 
-        # Since our previous update we've changed the algorythm of how 
-        # tasks are ran and being executed as now the low-level api is 
-        # used to prevent more blocking as well as faster performance.
+            if completed == self.ttl:
+                self.tx.put(None)
 
-        # - We now use the lower-level api to prevent blocking
-        
-        # - We now use aiologic to do the heavy-lifting for us to
-        #   Remain safe when grabbing and sending back all tasks
+        while True:
+            if len(pending) < self.concurrency:
+                task_info = await self.tx.async_get()
 
-        # - We no longer use while loops to prevent blocking / task stravation
-
-        # SEE: https://docs.python.org/3/library/asyncio-llapi-index.html
-        # SEE: https://docs.python.org/3/library/asyncio-eventloop.html#asyncio-example-call-later
-
-        def on_run():
-            nonlocal pending, completed, running, loop, finished
-
-            if pending or running:
-                if self.ttl and completed >= self.ttl:
-                    running = False
-
-                if (len(pending) < self.concurrency) or running:
-                    
-                    try:
-                        task = self.tx.green_get(blocking=False)
-                    except QueueEmpty:
-                        return loop.call_later(0.05, on_run)
-                    
-                    if task is None:
-                        running = False
-                        return loop.call_later(0.05, on_run)
+                if task_info is None:
+                    break
                 
-                    tid, func, args, kwargs = task
-                    future: asyncio.Future = asyncio.ensure_future(func(*args, **kwargs))
-                    future.add_done_callback(_on_completed)
-                    pending[future] = tid
-                
-                # We want to make sure that the other pending 
-                # tasks have the chance of finishing...
-                return loop.call_later(0.05, on_run)
+                task_id, func, args, kwargs = task_info
+
+                future = asyncio.ensure_future(func(*args, **kwargs))
+                future.add_done_callback(_on_completed)
+
+                pending[future] = task_id
             else:
-                # Label that we are now finished with everything...
-                finished.set()
+                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
 
-        loop.call_soon(on_run)
-        await finished.wait()
+        if pending:
+            await asyncio.wait(pending)
 
 
 
@@ -153,6 +143,7 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
         """Return results one-by-one as they are ready"""
         return self.results_generator()
 
+
     async def results_generator(self) -> AsyncIterator[_T]:
         """Return results one-by-one as they are ready"""
         for task_id in self.task_ids:
@@ -160,9 +151,8 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
 
     async def first_completed(self) -> AsyncIterator[_T]:
         """Return results one-by-one as tasks are being finished rather than by order,
-        This saves time over simply waiting for things in order or input and makes an 
-        asynchornous iterator for all the "first finishing" objects making everything 
-        smoother and more instant.
+        This saves the need for making a list by default and makes an asynchornous iterator for 
+        all the "first finishing" objects making everything smoother and more instant.
         ::
 
             async def coro(i):
@@ -174,8 +164,7 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
                     ...
         
         """
-        # TODO (Vizonex): Make a "first_completed method" inside of the ThreadPool 
-        # Class Object itself rather than simply being apart of here...
+        # TODO: Move First_completed method inside of the ThreadPool Class Object itself rather than in here...
         task_ids = list(set(self.task_ids)) 
         while task_ids:
             # Pop the longest running task from the stack first
@@ -194,12 +183,10 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
                 task_ids.append(tid)
                 await asyncio.sleep(0.005)
 
+
 # NOTE: Not very many things have changed from aiomultiprocess's
 # Pool Class Such as the removal of terminating since threads can't terminate
 # Pool was also renamed to ThreadPool so aiomultiprocess doesn't overlap itself...
-
-
-# TODO: Change how the pool handles checking for completed work so that performance improves
 
 
 class ThreadPool:
@@ -235,8 +222,13 @@ class ThreadPool:
         self.exception_handler = exception_handler
 
         # NOTE: Renamed processes to threads since were dealing with threads - Vizonex
+       
+        # TODO: (Vizonex) Turn self.threads and self.queues to 
+        # OrderDictionaries to help make the eventloop smoother 
+        # in function self.loop() so that visitation can be 
+        # distributed evenly.
         self.threads: Dict[Thread, QueueID] = {}
-        self.queues: Dict[QueueID, Tuple[Queue, Queue]] = {}
+        self.queues: Dict[QueueID, Tuple[SimpleQueue, SimpleQueue]] = {}
 
         self.running = True
         self.last_id = 0
@@ -261,8 +253,9 @@ class ThreadPool:
         :meta private:
         """
         for _ in range(self.queue_count):
-            tx = Queue()
-            rx = Queue()
+            tx = SimpleQueue()
+            rx = SimpleQueue()
+            # TODO: Typehint register_queue from Queue to aiologic.SimpleQueue...
             qid = self.scheduler.register_queue(tx)
 
             self.queues[qid] = (tx, rx)
@@ -273,16 +266,13 @@ class ThreadPool:
             self.threads[self.create_worker(qid)] = qid
             self.scheduler.register_thread(qid)
 
-    # TODO: Change how the loop function behaves by introducing 
-    # lower level apis for getting rid of the while loops
-    # which will prevent task stravation on the main loop
-    
     async def loop(self) -> None:
         """
         Maintain the pool of workers while open.
 
         :meta private:
         """
+       
         while self.threads or self.running:
             # clean up workers that reached TTL
             for thread in list(self.threads):
@@ -291,19 +281,16 @@ class ThreadPool:
                     if self.running:
                         self.threads[self.create_worker(qid)] = qid
 
-            # pull results into a shared dictionary for later retrieval
             for _, rx in self.queues.values():
-                while True:
-                    try:
-                        task_id, value, tb = rx.get_nowait()
-                        self.finish_work(task_id, value, tb)
+                
+                # TODO: try checking each rx queue individually 
+                # instead of draining all at one Time or maybe make 
+                # that Optional entirely up to the user with an enum
 
-                    except queue.Empty:
-                        break
+                for _ in range(len(rx)):
+                    task_id, value, tb = await rx.async_get()
+                    self.finish_work(task_id, value, tb)
 
-            # let someone else do some work for once
-            # NOTE: Without this the pool blocks when it shouldn't
-            # This could be due to how the loop is visiting different tasks
             await asyncio.sleep(0.005)
 
     def create_worker(self, qid: QueueID) -> Thread:
@@ -447,3 +434,4 @@ class ThreadPool:
             raise RuntimeError("pool is still open")
 
         await self._loop
+
