@@ -273,6 +273,10 @@ class ThreadPool:
             self.threads[self.create_worker(qid)] = qid
             self.scheduler.register_thread(qid)
 
+    # TODO: Change how the loop function behaves by introducing 
+    # lower level apis for getting rid of the while loops
+    # which will prevent task stravation on the main loop
+    
     async def loop(self) -> None:
         """
         Maintain the pool of workers while open.
