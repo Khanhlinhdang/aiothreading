@@ -22,15 +22,34 @@ SEE: https://github.com/x42005e1f/aiologic
 """
 
 
-# NOTE: From the Author (Vizonex):
-# - I knew these would never get implemented by anyone else but hopefully someone at least 
-# finds these to be inpirational or even somewhat useful with it's core concepts 
-# to begin with, most concepts were taken from the core threading library which I highly 
-# recommend you visit and read up on it's documentation.
-
 import threading
-import asyncio
-from typing import Optional, Union, Callable
+from typing import Callable, Optional, Union, Generic, Sequence
+import warnings
+
+from .types import CallableOrMethod, P, T 
+
+# TODO (Vizonex): warn that I am dropping 3.9 support in July 2025 when 
+# 3.9 no longer recieves Vulnerability fixes - Vizonex
+
+
+# slightly modified version of some code from stack overflow that I slightly altered for typehinting.
+# SEE: https://stackoverflow.com/questions/54949421/deprecate-a-function-parameter/54949947#54949947
+
+class deprecated_param(Generic[P, T]):
+    """Labels a parameter or list of parameters that will be set for deprecation"""
+    def __init__(self, deprecated_args:Sequence[str], version:str, reason:str):
+        self.deprecated_args = set(deprecated_args)
+        self.version = version
+        self.reason = reason
+
+    def __call__(self, func:CallableOrMethod[P, T]) -> CallableOrMethod[P, T]:
+        def wrapper(*args:P.args, **kwargs:P.kwargs):
+            found = self.deprecated_args.intersection(kwargs)
+            if found:
+                warnings.warn("Parameter(s) %s deprecated since version %s; %s" % (
+                    ', '.join(map("'{}'".format, found)), self.version, self.reason), category=UserWarning)
+            return func(*args, **kwargs)
+        return wrapper
 
 
 class Lock:
