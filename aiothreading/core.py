@@ -7,7 +7,10 @@ import logging
 import threading
 from typing import Any, Callable, Dict, Optional, Sequence
 
-from .types import Context, R, Unit
+from aiologic import Event
+
+from .types import Context, R, Unit, PREMATURE_STOP, PrematureStopException
+
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +47,7 @@ class Thread:
         initargs: Sequence[Any] = (),
         loop_initializer: Optional[Callable] = None,
         thread_target: Optional[Callable] = None,
+        stop_event: Event = Event(),
     ) -> None:
         # From aiomultiprocess
         if target is not None and not asyncio.iscoroutinefunction(target):
@@ -64,6 +68,9 @@ class Thread:
             initializer=initializer,
             initargs=initargs,
             loop_initializer=loop_initializer,
+            stop_event=stop_event,
+            # The Complete Event is an internal for checking that the thread exited...
+            complete_event=Event(),
         )
         self.aio_thread = threading.Thread(
             group=group,
@@ -72,9 +79,6 @@ class Thread:
             name=name,
             daemon=daemon,
         )
-
-        # Special object/Event used to determine if were done or not...
-        self.is_complete = threading.Event()
 
     def __await__(self) -> Any:
         """Enable awaiting of the thread result by chaining to `start()` & `join()`."""
@@ -95,8 +99,10 @@ class Thread:
         if timeout is not None:
             return await asyncio.wait_for(self.join(), timeout)
 
-        while self.aio_thread.is_alive():
-            await asyncio.sleep(0.005)
+        await self.unit.complete_event
+
+    # TODO: in 0.1.4 Turn Return Value into Union[R | THREAD_STOPPED_PREMATURELY_FLAG]
+    # Since there's a chance that if we stop it returns with nothing...
 
     @staticmethod
     def run_async(unit: Unit) -> R:
@@ -112,14 +118,52 @@ class Thread:
             if unit.initializer:
                 unit.initializer(*unit.initargs)
 
-            # TODO: Provide clean exit methods to thread even
-            # though threading isn't nessesarly designed for
-            # clean exits...
-            result: R = loop.run_until_complete(unit.target(*unit.args, **unit.kwargs))
+            async def inital_run(unit: Unit):
+                nonlocal loop
+                # We added 2 things to our executions
+                # - stop_listener kills main abruptly (our outside code takes care of cleanup)
+                # - main_future waited upon until it's either cancelled or finished
+
+                main_future = asyncio.ensure_future(
+                    unit.target(*unit.args, **unit.kwargs)
+                )
+                stop_listener = asyncio.ensure_future(unit.stop_event)
+
+                def on_compltete(fut: asyncio.Future[R]):
+                    nonlocal stop_listener
+                    if not stop_listener.done():
+                        stop_listener.remove_done_callback(on_stop)
+                        stop_listener.cancel()
+
+                def on_stop(fut: asyncio.Future[bool]):
+                    nonlocal main_future
+                    if not main_future.done():
+                        main_future.remove_done_callback(on_compltete)
+                        main_future.cancel()
+
+                main_future.add_done_callback(on_compltete)
+
+                # Add a singal that kills the thread prematurely...
+                stop_listener.add_done_callback(on_stop)
+
+                await asyncio.wait(
+                    (main_future, stop_listener), return_when=asyncio.FIRST_COMPLETED
+                )
+
+                if not main_future.cancelled() and main_future.done():
+                    return main_future.result()
+                else:
+                    return None
+
+            result: R = loop.run_until_complete(inital_run(unit))
 
             # Shudown everything after so that nothing complains back to us with a RuntimeWarning
             asyncio.set_event_loop(None)
             loop.close()
+
+            # if we were using the "join()" method or the
+            # __await__ protocol make sure that we release it here.
+            unit.complete_event.set()
             return result
 
         except Exception as e:
@@ -165,18 +209,26 @@ class Thread:
         """Native integral thread ID of this thread, or None if it has not been started."""
         return self.aio_thread.native_id
 
+    def terminate(self):
+        """Terminates the thread from running"""
+        return self.unit.stop_event.set()
+
 
 class Worker(Thread):
-    def __init__(self, *args, **kwargs) -> None:
+    # TODO: fix __init__ and all arguments to it.
+    def __init__(self, *args, raise_if_stopped: bool = True, **kwargs) -> None:
         super().__init__(*args, thread_target=Worker.run_async, **kwargs)
         self.unit.namespace.result = None
+        self.unit.namespace.raise_if_stopped = raise_if_stopped
 
     @staticmethod
     def run_async(unit: Unit) -> R:
         """Initialize the thread and event loop, then execute the coroutine."""
         try:
             result: R = Thread.run_async(unit)
+
             unit.namespace.result = result
+
             return result
 
         except BaseException as e:
@@ -191,9 +243,14 @@ class Worker(Thread):
     @property
     def result(self) -> R:
         """Easy access to the resulting value from the coroutine."""
+        # NOTE: ValueError Might be considered redundant since we now use a sentient value.
         if self.unit.namespace.result is None:
             raise ValueError("coroutine not completed")
-
+        elif (
+            self.unit.namespace.raise_if_stopped
+            and self.unit.namespace.result is PREMATURE_STOP
+        ):
+            raise PrematureStopException("Thread was stopped prematurely...")
         return self.unit.namespace.result
 
 
