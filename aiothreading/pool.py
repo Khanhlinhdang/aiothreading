@@ -1,4 +1,4 @@
-# Copyright 2022 Amy Reese
+ Copyright 2022 Amy Reese
 # Licensed under the MIT license
 # 2024 Modified by Vizonex
 
@@ -19,10 +19,11 @@ from typing import (
     Sequence,
     Tuple,
     TypeVar,
+    Union,
 )
 
-from .core import Thread, get_context
-from .scheduler import RoundRobin, Scheduler
+from .core import Thread 
+from .scheduler import Scheduler
 from .types import (
     LoopInitializer,
     PoolTask,
@@ -33,8 +34,9 @@ from .types import (
     TaskID,
     TracebackStr,
 )
+from .utils import deprecated_param
 
-from aiologic import SimpleQueue
+from aiologic import SimpleQueue, Queue
 
 MAX_TASKS_PER_CHILD = 0  # number of tasks to execute before recycling a child process
 CHILD_CONCURRENCY = 16  # number of tasks to execute simultaneously per child process
@@ -46,10 +48,15 @@ log = logging.getLogger(__name__)
 class ThreadPoolWorker(Thread):
     """Individual worker thread for the async pool."""
 
+    @deprecated_param(
+        ("ttl"),
+        version="0.1.3",
+        reason="Tasks To Live (TTL) will be removed in 0.1.4",
+    )
     def __init__(
         self,
-        tx: SimpleQueue,
-        rx: SimpleQueue,
+        tx: Union[SimpleQueue, Queue],
+        rx: Union[SimpleQueue, Queue],
         ttl: int = MAX_TASKS_PER_CHILD,
         concurrency: int = CHILD_CONCURRENCY,
         *,
@@ -74,7 +81,6 @@ class ThreadPoolWorker(Thread):
         """Pick up work, execute work, return results, rinse, repeat."""
         pending: Dict[asyncio.Future, TaskID] = {}
         completed = 0
-        
 
         # Changes Were Suggested by x42005e1f
         # SEE: https://github.com/Vizonex/aiothreading/issues/1#issuecomment-2623569854
@@ -98,6 +104,7 @@ class ThreadPoolWorker(Thread):
             self.rx.put_nowait((tid, result, tb))
             completed += 1
 
+            # Were gonna remove this section in 0.1.4
             if completed == self.ttl:
                 self.tx.put(None)
 
@@ -107,7 +114,7 @@ class ThreadPoolWorker(Thread):
 
                 if task_info is None:
                     break
-                
+
                 task_id, func, args, kwargs = task_info
 
                 future = asyncio.ensure_future(func(*args, **kwargs))
@@ -119,7 +126,6 @@ class ThreadPoolWorker(Thread):
 
         if pending:
             await asyncio.wait(pending)
-
 
 
 class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
@@ -143,7 +149,6 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
         """Return results one-by-one as they are ready"""
         return self.results_generator()
 
-
     async def results_generator(self) -> AsyncIterator[_T]:
         """Return results one-by-one as they are ready"""
         for task_id in self.task_ids:
@@ -151,7 +156,7 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
 
     async def first_completed(self) -> AsyncIterator[_T]:
         """Return results one-by-one as tasks are being finished rather than by order,
-        This saves the need for making a list by default and makes an asynchornous iterator for 
+        This saves the need for making a list by default and makes an asynchornous iterator for
         all the "first finishing" objects making everything smoother and more instant.
         ::
 
@@ -162,15 +167,17 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
             async with ThreadPool() as pool:
                 async for finished in pool.map(coro, [1, 2, 3]).first_completed():
                     ...
-        
+
         """
         # TODO: Move First_completed method inside of the ThreadPool Class Object itself rather than in here...
-        task_ids = list(set(self.task_ids)) 
+        task_ids = list(set(self.task_ids))
         while task_ids:
             # Pop the longest running task from the stack first
             tid = task_ids.pop(0)
 
-            __result: Optional[Tuple[_T, Optional[TracebackStr]]] = self.pool._results.pop(tid, None)
+            __result: Optional[Tuple[_T, Optional[TracebackStr]]] = (
+                self.pool._results.pop(tid, None)
+            )
             if __result:
                 value, tb = __result
                 if tb:
@@ -178,7 +185,7 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
                 else:
                     yield value
             else:
-                # Place back on the stack and 
+                # Place back on the stack and
                 # visit other things on the eventloop
                 task_ids.append(tid)
                 await asyncio.sleep(0.005)
@@ -192,27 +199,27 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
 class ThreadPool:
     """Execute coroutines on a pool of threads."""
 
+    @deprecated_param(
+        deprecated_args=["scheduler", "maxtasksperchild"],
+        version="0.1.3",
+        reason="Removed for Performance Optimizations, Sheduled for deletion in 0.1.5",
+    )
     def __init__(
         self,
         threads: Optional[int] = None,
         initializer: Callable[..., None] = None,
         initargs: Sequence[Any] = (),
-        maxtasksperchild: int = MAX_TASKS_PER_CHILD,
+        maxtasksperchild: int = MAX_TASKS_PER_CHILD,  # Sheduled for removal in soon as a performance optimization
         childconcurrency: int = CHILD_CONCURRENCY,
-        queuecount: Optional[int] = None,
-        scheduler: Optional[Scheduler] = None,
+        queuecount: Optional[int] = None,  # queuecount is not used anymore
+        scheduler: Optional[
+            Scheduler
+        ] = None,  # Scheduler is now Deprecated and no longer in use anymore
         loop_initializer: Optional[LoopInitializer] = None,
         exception_handler: Optional[Callable[[BaseException], None]] = None,
     ):
-        self.context = get_context()
-
-        self.scheduler = scheduler or RoundRobin()
         # From concurrent.futures.ThreadPoolExecutor
         self.thread_count = min(32, threads or ((os.cpu_count() or 1) + 4))
-        self.queue_count = max(1, queuecount or 1)
-
-        if self.queue_count > self.thread_count:
-            raise ValueError("queue count must be <= thread count")
 
         self.initializer = initializer
         self.initargs = initargs
@@ -222,13 +229,29 @@ class ThreadPool:
         self.exception_handler = exception_handler
 
         # NOTE: Renamed processes to threads since were dealing with threads - Vizonex
-       
-        # TODO: (Vizonex) Turn self.threads and self.queues to 
-        # OrderDictionaries to help make the eventloop smoother 
-        # in function self.loop() so that visitation can be 
-        # distributed evenly.
-        self.threads: Dict[Thread, QueueID] = {}
-        self.queues: Dict[QueueID, Tuple[SimpleQueue, SimpleQueue]] = {}
+
+        # Were going to use a list instead of a dicitonary for initalization
+        # This is more or less an optimization
+        self.threads: list[Thread] = []
+
+        # Queue count is important to keep because of chunking
+        # Lets say we have a textfile that is 10 GB (Gigabytes)
+        # We want to go through all of them but the ram in our
+        # computer is minimal it could cause a memory-error
+
+        # So holding onto queue count is important in that case and shall not be removed.
+
+        self.queue_count = queuecount
+
+        if self.queue_count is not None:
+            if self.queue_count > self.thread_count:
+                raise ValueError("queue count must be <= thread count")
+
+            self.rx = Queue(self.queue_count)
+            self.tx = Queue(self.queue_count)
+        else:
+            self.rx = SimpleQueue()
+            self.tx = SimpleQueue()
 
         self.running = True
         self.last_id = 0
@@ -248,23 +271,13 @@ class ThreadPool:
 
     def init(self) -> None:
         """
-        Create the initial mapping of processes and queues.
+        Create the initial mapping of threads and queues.
 
         :meta private:
         """
-        for _ in range(self.queue_count):
-            tx = SimpleQueue()
-            rx = SimpleQueue()
-            # TODO: Typehint register_queue from Queue to aiologic.SimpleQueue...
-            qid = self.scheduler.register_queue(tx)
 
-            self.queues[qid] = (tx, rx)
-
-        qids = list(self.queues.keys())
-        for i in range(self.thread_count):
-            qid = qids[i % self.queue_count]
-            self.threads[self.create_worker(qid)] = qid
-            self.scheduler.register_thread(qid)
+        while len(self.threads) != self.thread_count:
+            self.threads.append(self.create_worker())
 
     async def loop(self) -> None:
         """
@@ -272,37 +285,23 @@ class ThreadPool:
 
         :meta private:
         """
-       
         while self.threads or self.running:
-            # clean up workers that reached TTL
-            for thread in list(self.threads):
-                if not thread.is_alive():
-                    qid = self.threads.pop(thread)
-                    if self.running:
-                        self.threads[self.create_worker(qid)] = qid
+            task_info = await self.rx.async_get()
 
-            for _, rx in self.queues.values():
-                
-                # TODO: try checking each rx queue individually 
-                # instead of draining all at one Time or maybe make 
-                # that Optional entirely up to the user with an enum
+            if task_info is None:
+                continue
 
-                for _ in range(len(rx)):
-                    task_id, value, tb = await rx.async_get()
-                    self.finish_work(task_id, value, tb)
+            self.finish_work(*task_info)
 
-            await asyncio.sleep(0.005)
-
-    def create_worker(self, qid: QueueID) -> Thread:
+    def create_worker(self) -> Thread:
         """
         Create a worker thread attached to the given transmit and receive queues.
 
         :meta private:
         """
-        tx, rx = self.queues[qid]
         thread = ThreadPoolWorker(
-            tx,
-            rx,
+            self.tx,
+            self.rx,
             self.maxtasksperchild,
             self.childconcurrency,
             initializer=self.initializer,
@@ -326,10 +325,7 @@ class ThreadPool:
         """
         self.last_id += 1
         task_id = TaskID(self.last_id)
-
-        qid = self.scheduler.schedule_task(task_id, func, args, kwargs)
-        tx, _ = self.queues[qid]
-        tx.put_nowait((task_id, func, args, kwargs))
+        self.tx.put_nowait((task_id, func, args, kwargs))
         return task_id
 
     def finish_work(
@@ -341,7 +337,6 @@ class ThreadPool:
         :meta private:
         """
         self._results[task_id] = value, tb
-        self.scheduler.complete_task(task_id)
 
     async def results(self, tids: Sequence[TaskID]) -> Sequence[R]:
         """
@@ -387,6 +382,7 @@ class ThreadPool:
         self,
         func: Callable[[T], Awaitable[R]],
         iterable: Sequence[T],
+        # TODO: Let's fulfill Amy's Request by 0.1.7 for our library to implement chunking...
         # chunksize: int = None,  # todo: implement chunking maybe
     ) -> ThreadPoolResult[R]:
         """Run a coroutine once for each item in the iterable."""
@@ -409,29 +405,27 @@ class ThreadPool:
         tids = [self.queue_work(func, args, {}) for args in iterable]
         return ThreadPoolResult(self, tids)
 
+    # TODO: Turn Close and Terminate into async functions?
     def close(self) -> None:
         """Close the pool to new visitors."""
         self.running = False
-        for qid in self.threads.values():
-            tx, _ = self.queues[qid]
-            tx.put_nowait(None)
+
+        # TODO: Better signals for stopping threads from running.
+        for t in self.threads:
+            if t.is_alive():
+                self.tx.green_put(None)
 
     def terminate(self) -> None:
         """No running by the pool!"""
         if self.running:
             self.close()
 
-        # (Vizonex NOTE): There is no way to kill threads (yet) might throw an error here if threads were already terminated...
-        # so I'm commenting this out send me a pull request
-        # if you want to come up with a better method...
-
-        # for process in self.threads:
-        #     process.terminate()
+        for t in self.threads:
+            t.terminate()
 
     async def join(self) -> None:
-        """Wait for the pool to finish gracefully."""
+        """Waits for the pool to be finished gracefully."""
         if self.running:
             raise RuntimeError("pool is still open")
 
         await self._loop
-
