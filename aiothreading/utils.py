@@ -28,7 +28,7 @@ import warnings
 from .types import CallableOrMethod, P, T 
 
 # TODO (Vizonex): warn that I am dropping 3.9 support in July 2025 when 
-# 3.9 no longer recieves Vulnerability fixes - Vizonex
+# 3.9 no longer recieves Vulnerability fixes
 
 
 # slightly modified version of some code from stack overflow that I slightly altered for typehinting.
