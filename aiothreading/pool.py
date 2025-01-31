@@ -1,4 +1,4 @@
- Copyright 2022 Amy Reese
+# Copyright 2022 Amy Reese
 # Licensed under the MIT license
 # 2024 Modified by Vizonex
 
