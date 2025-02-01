@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Optional, Sequence
 
 from aiologic import Event
 
-from .types import Context, R, Unit, PREMATURE_STOP, PrematureStopException
+from .types import R, Unit, PREMATURE_STOP, PrematureStopException
 
 
 log = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 
 # NOTE: Were not using multiprocessing however it's a good idea to
 # have a Context to prevent variables from bleeding out
-context = Context()
+# context = Context()
 
 
 async def not_implemented(*args: Any, **kwargs: Any) -> None:
@@ -25,10 +25,10 @@ async def not_implemented(*args: Any, **kwargs: Any) -> None:
     raise NotImplementedError()
 
 
-def get_context() -> Context:
-    """Get the current active global context."""
-    global context
-    return context
+# def get_context() -> Context:
+#     """Get the current active global context."""
+#     global context
+#     return context
 
 
 class Thread:
@@ -151,6 +151,8 @@ class Thread:
                 )
 
                 if not main_future.cancelled() and main_future.done():
+                    if main_future.exception() is not None:
+                        return main_future.exception()
                     return main_future.result()
                 else:
                     return None
@@ -161,9 +163,7 @@ class Thread:
             asyncio.set_event_loop(None)
             loop.close()
 
-            # if we were using the "join()" method or the
-            # __await__ protocol make sure that we release it here.
-            unit.complete_event.set()
+            
             return result
 
         except Exception as e:
@@ -175,6 +175,12 @@ class Thread:
             finally:
                 pass
             raise e
+
+        finally:
+            # if we were using the "join()" method or the
+            # __await__ protocol make sure that we release it here after returning the given value...
+
+            unit.complete_event.set()
 
     def start(self) -> None:
         """Start the child thread."""
@@ -252,5 +258,3 @@ class Worker(Thread):
         ):
             raise PrematureStopException("Thread was stopped prematurely...")
         return self.unit.namespace.result
-
-
