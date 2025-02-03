@@ -8,6 +8,7 @@ import threading
 from typing import Any, Callable, Dict, Optional, Sequence
 
 from aiologic import Event
+from aiologic.lowlevel import Flag
 
 from .types import R, Unit, PREMATURE_STOP, PrematureStopException
 
@@ -47,7 +48,7 @@ class Thread:
         initargs: Sequence[Any] = (),
         loop_initializer: Optional[Callable] = None,
         thread_target: Optional[Callable] = None,
-        stop_event: Event = Event(),
+        stop_event: Flag = Flag(),
     ) -> None:
         # From aiomultiprocess
         if target is not None and not asyncio.iscoroutinefunction(target):
@@ -97,7 +98,7 @@ class Thread:
             raise ValueError("must start thread before joining it")
 
         if timeout is not None:
-            return await asyncio.wait_for(self.join(), timeout)
+            return await asyncio.wait_for(self.unit.complete_event, timeout)
 
         await self.unit.complete_event
 
@@ -118,55 +119,13 @@ class Thread:
             if unit.initializer:
                 unit.initializer(*unit.initargs)
 
-            async def inital_run(unit: Unit):
-                nonlocal loop
-                # We added 2 things to our executions
-                # - stop_listener kills main abruptly (our outside code takes care of cleanup)
-                # - main_future waited upon until it's either cancelled or finished
+            task = loop.create_task(unit.target(*unit.args, **unit.kwargs))
+            unit.stop_event.set((loop, task))
+            return loop.run_until_complete(task)
 
-                main_future = asyncio.ensure_future(
-                    unit.target(*unit.args, **unit.kwargs)
-                )
-                stop_listener = asyncio.ensure_future(unit.stop_event)
-
-                def on_compltete(fut: asyncio.Future[R]):
-                    nonlocal stop_listener
-                    if not stop_listener.done():
-                        stop_listener.remove_done_callback(on_stop)
-                        stop_listener.cancel()
-
-                def on_stop(fut: asyncio.Future[bool]):
-                    nonlocal main_future
-                    if not main_future.done():
-                        main_future.remove_done_callback(on_compltete)
-                        main_future.cancel()
-
-                main_future.add_done_callback(on_compltete)
-
-                # Add a singal that kills the thread prematurely...
-                stop_listener.add_done_callback(on_stop)
-
-                await asyncio.wait(
-                    (main_future, stop_listener), return_when=asyncio.FIRST_COMPLETED
-                )
-
-                if not main_future.cancelled() and main_future.done():
-                    if main_future.exception() is not None:
-                        return main_future.exception()
-                    return main_future.result()
-                else:
-                    return None
-
-            result: R = loop.run_until_complete(inital_run(unit))
-
-            # Shudown everything after so that nothing complains back to us with a RuntimeWarning
-            asyncio.set_event_loop(None)
-            loop.close()
-
-            
-            return result
 
         except Exception as e:
+            # TODO: Better Unittests & Exception Suppressing in future update? Example might be RuntimeError after Cancellation has began...
             log.exception(f"aio thread {threading.get_ident()} failed")
             # Shutdown the loop if there was indeed failure...
             try:
@@ -179,7 +138,9 @@ class Thread:
         finally:
             # if we were using the "join()" method or the
             # __await__ protocol make sure that we release it here after returning the given value...
-
+            # Shudown everything after so that nothing complains back to us with a RuntimeWarning
+            asyncio.set_event_loop(None)
+            loop.close()
             unit.complete_event.set()
 
     def start(self) -> None:
@@ -193,7 +154,7 @@ class Thread:
 
     def is_alive(self) -> bool:
         """Is the thread running."""
-        return self.aio_thread.is_alive()
+        return self.aio_thread.is_alive() and (not self.unit.complete_event)
 
     @property
     def daemon(self) -> bool:
@@ -217,9 +178,14 @@ class Thread:
 
     def terminate(self):
         """Terminates the thread from running"""
-        return self.unit.stop_event.set()
-
-
+        loop, task = self.unit.stop_event.get()
+        # Sometimes the eventloop is closed so check to see that it's still open first...
+        if not loop.is_closed():
+            # Override with PREMATURE_STOP Sentient Value so that the main task 
+            # will Cancel and Worker subclass throws the right error.
+            loop.call_soon_threadsafe(task.set_result, PREMATURE_STOP)
+            
+        
 class Worker(Thread):
     # TODO: fix __init__ and all arguments to it.
     def __init__(self, *args, raise_if_stopped: bool = True, **kwargs) -> None:
