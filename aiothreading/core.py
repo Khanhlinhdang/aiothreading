@@ -32,6 +32,8 @@ async def not_implemented(*args: Any, **kwargs: Any) -> None:
 #     return context
 
 
+
+
 class Thread:
     """Execute a coroutine on a spreate thread"""
 
@@ -118,14 +120,21 @@ class Thread:
 
             if unit.initializer:
                 unit.initializer(*unit.initargs)
-
+            
+            
             task = loop.create_task(unit.target(*unit.args, **unit.kwargs))
             unit.stop_event.set((loop, task))
-            return loop.run_until_complete(task)
-
+            try:
+                return loop.run_until_complete(task)
+            except asyncio.CancelledError as e:
+                # Suppress MainTask's cancellation only...
+                if not task.cancelled():
+                    raise e
+                else:
+                    # We Exited Prematurely so return our sentient value for Worker...
+                    return PREMATURE_STOP
 
         except Exception as e:
-            # TODO: Better Unittests & Exception Suppressing in future update? Example might be RuntimeError after Cancellation has began...
             log.exception(f"aio thread {threading.get_ident()} failed")
             # Shutdown the loop if there was indeed failure...
             try:
@@ -142,6 +151,7 @@ class Thread:
             asyncio.set_event_loop(None)
             loop.close()
             unit.complete_event.set()
+            
 
     def start(self) -> None:
         """Start the child thread."""
@@ -154,7 +164,7 @@ class Thread:
 
     def is_alive(self) -> bool:
         """Is the thread running."""
-        return self.aio_thread.is_alive() and (not self.unit.complete_event)
+        return self.aio_thread.is_alive()
 
     @property
     def daemon(self) -> bool:
@@ -179,13 +189,11 @@ class Thread:
     def terminate(self):
         """Terminates the thread from running"""
         loop, task = self.unit.stop_event.get()
-        # Sometimes the eventloop is closed so check to see that it's still open first...
         if not loop.is_closed():
-            # Override with PREMATURE_STOP Sentient Value so that the main task 
-            # will Cancel and Worker subclass throws the right error.
-            loop.call_soon_threadsafe(task.set_result, PREMATURE_STOP)
-            
+            loop.call_soon_threadsafe(task.cancel)
         
+        
+
 class Worker(Thread):
     # TODO: fix __init__ and all arguments to it.
     def __init__(self, *args, raise_if_stopped: bool = True, **kwargs) -> None:
