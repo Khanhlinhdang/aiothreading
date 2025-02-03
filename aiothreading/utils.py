@@ -21,15 +21,10 @@ NOTE: Some Parts of this module will soon be deprecated in Favor of aiologic
 SEE: https://github.com/x42005e1f/aiologic
 """
 
-
 import threading
 from typing import Callable, Optional, Union, Generic, Sequence
 import warnings
 
-from .types import CallableOrMethod, P, T 
-
-# TODO (Vizonex): warn that I am dropping 3.9 support in July 2025 when 
-# 3.9 no longer recieves Vulnerability fixes - Vizonex
 
 
 # slightly modified version of some code from stack overflow that I slightly altered for typehinting.
