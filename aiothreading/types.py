@@ -1,6 +1,6 @@
 # Copied from aiomultiprocess with many modifications
 
-from asyncio import BaseEventLoop
+from asyncio import BaseEventLoop, AbstractEventLoop, Task
 import enum
 from typing import (
     Any,
@@ -17,6 +17,7 @@ from typing import (
 )
 import sys
 
+from aiologic.lowlevel import Flag
 from aiologic import Event
 
 if sys.version_info < (3, 10):
@@ -46,7 +47,7 @@ PoolTask = Optional[Tuple[TaskID, Callable[..., R], Sequence[T], Dict[str, T]]]
 PoolResult = Tuple[TaskID, Optional[R], Optional[TracebackStr]]
 
 
-# senitent ENUM FOR Worker, helps to raise PrematrueStopError when the a Worker was Stopped Prematurely
+# senitent ENUM FOR Worker, Raises PrematrueStopError when the a Thread was Stopped Prematurely
 PREMATURE_STOP = enum.IntEnum(
     "_THREAD_STOPPED", "PREMATURE_STOP", start=0
 ).PREMATURE_STOP
@@ -69,8 +70,10 @@ class Unit(NamedTuple):
     initargs: Sequence[Any] = ()
     loop_initializer: Optional[LoopInitializer] = None
     runner: Optional[Callable] = None
-    stop_event: Event = Event()
+    stop_event: Flag[Tuple[AbstractEventLoop, Task]] = Flag()
     complete_event: Event = Event()
+    # _loop:Optional[AbstractEventLoop] = None
+    # _task:Optional[Task]
 
 
 class ProxyException(Exception):
