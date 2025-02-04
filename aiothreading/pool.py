@@ -38,7 +38,7 @@ from .types import (
 )
 from .utils import deprecated_param
 
-from aiologic import SimpleQueue, Queue
+from aiologic import SimpleQueue, Queue, REvent
 
 MAX_TASKS_PER_CHILD = 0  # number of tasks to execute before recycling a child process
 CHILD_CONCURRENCY = 16  # number of tasks to execute simultaneously per child process
@@ -103,7 +103,6 @@ class ThreadPoolWorker(Thread):
     def __init__(
         self,
         tx: Union[SimpleQueue[tuple[TaskID, _WorkItem]], Queue[TaskID, _WorkItem]],
-        rx: Union[SimpleQueue, Queue],
         ttl: int = MAX_TASKS_PER_CHILD,
         concurrency: int = CHILD_CONCURRENCY,
         *,
@@ -123,7 +122,6 @@ class ThreadPoolWorker(Thread):
         # self.exception_handler = exception_handler
         self.ttl = max(0, ttl)
         self.tx = tx
-        self.rx = rx
 
 
     async def run(self) -> None:
@@ -275,12 +273,12 @@ class ThreadPool:
         if self.queue_count is not None:
             if self.queue_count > self.thread_count:
                 raise ValueError("queue count must be <= thread count")
-
-            self.rx = Queue(self.queue_count)
             self.tx = Queue(self.queue_count)
         else:
-            self.rx = SimpleQueue()
             self.tx = SimpleQueue()
+
+        self.tasks_running = 0 
+        self.tasks_complete = REvent(True)
 
         self.running = True
         self.last_id = 0
@@ -320,7 +318,6 @@ class ThreadPool:
         """
         thread = ThreadPoolWorker(
             self.tx,
-            self.rx,
             self.maxtasksperchild,
             self.childconcurrency,
             initializer=self.initializer,
@@ -345,9 +342,22 @@ class ThreadPool:
         if not self.running:
             raise RuntimeError("pool is closed")
         
+        def on_complete(fut):
+            self.tasks_running -= 1
+            if self.tasks_running <= 0:
+                self.tasks_complete.set()
+
+
+        self.tasks_complete.clear()
+        self.tasks_running += 1
+
         self.last_id += 1
+
         task_id = TaskID(self.last_id)
         fut = self._loop.create_future()
+        
+        
+        fut.add_done_callback()
 
         self.tx.put((task_id, _WorkItem(fut, self._loop, func, args, kwargs, self.exception_handler)))
         return fut
@@ -371,12 +381,14 @@ class ThreadPool:
         self,
         func: Callable[[T], Awaitable[R]],
         iterable: Sequence[T],
-        chunksize: int = 4
+        chunksize: Optional[int] = None
     ) -> ThreadPoolResult[R]:
         """Run a coroutine once for each item in the iterable."""
         if not self.running:
             raise RuntimeError("pool is closed")
         
+        if chunksize is None or chunksize <= 1:
+            chunksize = self.childconcurrency * self.thread_count
 
         async def chunking():
             nonlocal iterable
@@ -392,7 +404,7 @@ class ThreadPool:
                         running = False
                         break
 
-                done, _ = await asyncio.wait(chunks, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(chunks, timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
                 for d in done:
                     chunks.remove(d)
                     yield await d
@@ -400,7 +412,7 @@ class ThreadPool:
             if chunks:
                 for completed in asyncio.as_completed(chunks):
                     yield await completed
-            
+        
         return ThreadPoolResult(self, chunking())
         
 
@@ -408,12 +420,15 @@ class ThreadPool:
         self,
         func: Callable[..., Awaitable[R]],
         iterable: Sequence[Sequence[T]],
-        chunksize: int = 4
+        chunksize: Optional[int] = None
     ) -> ThreadPoolResult[R]:
         """Run a coroutine once for each sequence of items in the iterable."""
         if not self.running:
             raise RuntimeError("pool is closed")
         
+        if chunksize is None or chunksize <= 1:
+            chunksize = self.childconcurrency * self.thread_count
+
 
         async def chunking():
             nonlocal iterable
@@ -429,7 +444,7 @@ class ThreadPool:
                         running = False
                         break
 
-                done, _ = await asyncio.wait(chunks, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(chunks, timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
                 for d in done:
                     chunks.remove(d)
                     yield await d
@@ -439,7 +454,7 @@ class ThreadPool:
                     yield await completed
             
         return ThreadPoolResult(self, chunking())
-
+    
     # TODO: Turn Close and Terminate into async functions?
     def close(self) -> None:
         """Close the pool to new visitors."""
@@ -462,8 +477,12 @@ class ThreadPool:
         """Waits for the pool to be finished gracefully."""
         if self.running:
             raise RuntimeError("pool is still open")
-
+        
+        # wait for the futures submitted to complete...
+        await self.tasks_complete
+        
         for t in self.threads:
             await t
         
+
 
