@@ -21,10 +21,27 @@ NOTE: Some Parts of this module will soon be deprecated in Favor of aiologic
 SEE: https://github.com/x42005e1f/aiologic
 """
 
+import asyncio
+import sys
 import threading
-from typing import Callable, Optional, Union, Generic, Sequence
 import warnings
 
+from typing import Callable, Generic, Optional, Sequence, TypeVar, Union
+
+if sys.version_info < (3, 10):
+    from typing_extensions import ParamSpec, Concatenate
+else:
+    from typing import ParamSpec, Concatenate
+
+if sys.version_info < (3, 11):
+    from typing_extensions import Self
+else:
+    from typing import Self
+
+T = TypeVar("T")
+P = ParamSpec("P")
+
+CallableOrMethod = Union[Callable[Concatenate[Self, P], T], Callable[P, T]]
 
 
 # slightly modified version of some code from stack overflow that I slightly altered for typehinting.
