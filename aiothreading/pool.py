@@ -101,7 +101,7 @@ class ThreadPoolWorker(Thread):
 
                 tb = traceback.format_exc()
 
-            self.rx.put_nowait((tid, result, tb))
+            self.rx.green_put((tid, result, tb))
             completed += 1
 
             # Were gonna remove this section in 0.1.4
