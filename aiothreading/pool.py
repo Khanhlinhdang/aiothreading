@@ -408,14 +408,37 @@ class ThreadPool:
         self,
         func: Callable[..., Awaitable[R]],
         iterable: Sequence[Sequence[T]],
-        # chunksize: int = None,  # todo: implement chunking maybe
+        chunksize: int = 4
     ) -> ThreadPoolResult[R]:
         """Run a coroutine once for each sequence of items in the iterable."""
         if not self.running:
             raise RuntimeError("pool is closed")
+        
 
-        tids = [self.queue_work(func, args, {}) for args in iterable]
-        return ThreadPoolResult(self, tids)
+        async def chunking():
+            nonlocal iterable
+            running = True
+            chunks = set()
+            it = iter(iterable)
+            while running:
+
+                while len(chunks) < chunksize:
+                    try:
+                        chunks.add(self.submit(func, next(it), {}))
+                    except StopIteration:
+                        running = False
+                        break
+
+                done, _ = await asyncio.wait(chunks, return_when=asyncio.FIRST_COMPLETED)
+                for d in done:
+                    chunks.remove(d)
+                    yield await d
+            
+            if chunks:
+                for completed in asyncio.as_completed(chunks):
+                    yield await completed
+            
+        return ThreadPoolResult(self, chunking())
 
     # TODO: Turn Close and Terminate into async functions?
     def close(self) -> None:
