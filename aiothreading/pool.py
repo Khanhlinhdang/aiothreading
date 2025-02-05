@@ -1,171 +1,154 @@
 # Copyright 2022 Amy Reese
 # Licensed under the MIT license
 # 2024 Modified by Vizonex
+# 2025 Modified by x42005e1f
 
 import asyncio
-import logging
 import os
-import traceback
+import sys
 
+from concurrent.futures import Future, InvalidStateError
+from functools import partial
+from types import TracebackType
 from typing import (
     Any,
     AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
+    Coroutine,
     Dict,
     Generator,
+    List,
     Optional,
     Sequence,
-    Tuple,
     TypeVar,
-    Union,
-    Generic,
-    overload
 )
 
 from .core import Thread 
 from .scheduler import Scheduler
-from .types import (
-    LoopInitializer,
-    PoolTask,
-    ProxyException,
-    QueueID,
-    R,
-    T,
-    TaskID,
-    TracebackStr,
-)
+from .types import LoopInitializer, ProxyException, R, T
 from .utils import deprecated_param
 
-from aiologic import SimpleQueue, Queue, REvent
+from aiologic import SimpleQueue, CountdownEvent, Condition
 
 MAX_TASKS_PER_CHILD = 0  # number of tasks to execute before recycling a child process
-CHILD_CONCURRENCY = 16  # number of tasks to execute simultaneously per child process
+CHILD_CONCURRENCY = 0  # number of tasks to execute simultaneously per child process
+
 _T = TypeVar("_T")
 
-log = logging.getLogger(__name__)
+
+def _on_complete(
+    loop: asyncio.AbstractEventLoop,
+    task: Optional[asyncio.Task[Any]],
+    future: Future[Any],
+) -> None:
+    if future.cancelled() and task is not None:
+        loop.call_soon_threadsafe(task.cancel)
 
 
-# Based off concurrent.futures.thread
-# This would solve multiple problems with `results`, `apply`, `loop` and `finish_work` 
-class _WorkItem(Generic[T]):
-    def __init__(
-        self,
-        future:asyncio.Future[T], 
-        loop:asyncio.AbstractEventLoop, 
-        fn:Callable[..., Awaitable[T]], 
-        args:Tuple, 
-        kwargs:Dict,
+async def _work(
+    func: Callable[..., Coroutine[Any, Any, Any]],
+    args: Sequence[Any],
+    kwargs: Dict[str, Any],
+    future: Future[Any],
+    any_completed: Condition[None],
+    all_completed: CountdownEvent,
+    exception_handler: Optional[Callable[[BaseException], None]],
+) -> None:
+    try:
+        if future.cancelled():
+            return
 
-        exception_handler: Optional[Callable[[BaseException], None]]
-    ):
-        # _loop would be the main loop
-        self._loop = loop
-        self.future = future
+        future.add_done_callback(partial(
+            _on_complete,
+            asyncio.get_running_loop(),
+            asyncio.current_task(),
+        ))
 
-        # This future could be returned inside of a submit function.
-        self.fn = fn
-        self.args = args
-        self.kwargs = kwargs
-        self.exception_handler = exception_handler
-    
-    async def run(self):
+        result = await func(*args, **kwargs)
+    except BaseException as exc:
         try:
-            result = await self.fn(*self.args, **self.kwargs)
-        except Exception as exc:
-            if self.exception_handler:
-                self.exception_handler(exc)
-            else:
-                self._loop.call_soon_threadsafe(self.future.set_exception, ProxyException(traceback.format_exc()))
-        else:
-            self._loop.call_soon_threadsafe(self.future.set_result, result)
+            if exception_handler is not None:
+                exception_handler(exc)
+        finally:
+            # TODO: set original exception instead of ProxyException
+            try:
+                future.set_exception(ProxyException().with_traceback(
+                    exc.__traceback__,
+                ))
+            except InvalidStateError:  # future is cancelled
+                pass
+    else:
+        try:
+            future.set_result(result)
+        except InvalidStateError:  # future is cancelled
+            pass
+    finally:
+        any_completed.notify_all()
+        all_completed.down()
 
-        # Return `self` so the future carrying the object can 
-        # dereference it with delete "del"
-        return self 
-    
+        del future  # break a reference cycle with the exception
 
-class ThreadPoolWorker(Thread):
+
+class ThreadPoolWorker(Thread[None]):
     """Individual worker thread for the async pool."""
-
 
     @deprecated_param(
         ("ttl"),
         version="0.1.3",
         reason="Tasks To Live (TTL) will be removed in 0.1.4",
     )
-    # @deprecated_param(
-    #     "exception_handler",
-    #     version="0.1.3",
-    #     reason="Moved into _WorkItem will be removed in 0.1.4"
-    # )
     def __init__(
         self,
-        tx: Union[SimpleQueue[tuple[TaskID, _WorkItem]], Queue[TaskID, _WorkItem]],
+        tx: SimpleQueue[Optional[tuple[
+            Callable[..., Coroutine[Any, Any, Any]],
+            Sequence[Any],
+            Dict[str, Any],
+            Future[Any],
+        ]]],
         ttl: int = MAX_TASKS_PER_CHILD,
         concurrency: int = CHILD_CONCURRENCY,
         *,
-        initializer: Optional[Callable] = None,
-        initargs: Sequence[Any] = (),
-        loop_initializer: Optional[LoopInitializer] = None,
-        # Moved to _WorkItem
         exception_handler: Optional[Callable[[BaseException], None]] = None,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(
-            target=self.run,
-            initializer=initializer,
-            initargs=initargs,
-            loop_initializer=loop_initializer,
-        )
-        self.concurrency = max(1, concurrency)
-        # self.exception_handler = exception_handler
-        self.ttl = max(0, ttl)
-        self.tx = tx
+        super().__init__(target=self.run, args=None, kwargs=None, **kwargs)
 
+        self.tx = tx
+        self.concurrency = concurrency
+        self.exception_handler = exception_handler
+
+        self.any_completed = Condition(None)
+        self.all_completed = CountdownEvent()
 
     async def run(self) -> None:
-        """Pick up work, execute work, return results, rinse, repeat."""
-        pending: Dict[asyncio.Future[_WorkItem], TaskID] = {}
-        completed = 0
-
-        # Changes Were Suggested by x42005e1f
-        # SEE: https://github.com/Vizonex/aiothreading/issues/1#issuecomment-2623569854
-
-        def _on_completed(f: asyncio.Future[_WorkItem]):
-            nonlocal completed
-            nonlocal pending
-
-            pending.pop(f)
-            
-            # NOTE: (Vizonex) I put the exception handler in the _WorkItem
-            item = f.result()
-            del item
-
-            completed += 1
-
-            # # Were gonna remove this section in 0.1.4
-            if completed == self.ttl:
-                self.tx.put(None)
-
+        """Pick up work, schedule work, repeat."""
         while True:
-            if len(pending) < self.concurrency:
+            if self.pending < self.concurrency or self.concurrency <= 0:
                 task_info = await self.tx.async_get()
 
                 if task_info is None:
                     break
-                
-                tid , work = task_info
-                future = asyncio.ensure_future(work.run())
-                future.add_done_callback(_on_completed)
-                pending[future] = tid
+
+                self.all_completed.up()
+                asyncio.create_task(_work(
+                    *task_info,
+                    self.any_completed,
+                    self.all_completed,
+                    self.exception_handler,
+                ))
             else:
-                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                await self.any_completed
 
-        if pending:
-            await asyncio.wait(pending)
+        await self.all_completed
 
-    
+    def key(self) -> int:
+        return len(self.tx) + self.pending
+
+    @property
+    def pending(self) -> int:
+        return self.all_completed.value
 
 
 class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
@@ -173,32 +156,32 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
     Asynchronous proxy for map/starmap results. Can be awaited or used with `async for`.
     """
 
-    def __init__(self, pool: "ThreadPool", task_iterator:AsyncIterable[_T]):
-        self.pool = pool
-        self.tasks = task_iterator
+    def __init__(self, futures: Sequence[asyncio.Future[_T]]):
+        self.futures = futures
 
-    def __await__(self) -> Generator[Any, None, Sequence[_T]]:
+    def __await__(self) -> Generator[Any, Any, Sequence[_T]]:
         """Wait for all results and return them as a sequence"""
-        return self.results().__await__()
+        return (yield from self.results().__await__())
 
     async def results(self) -> Sequence[_T]:
         """Wait for all results and return them as a sequence"""
-        return [t async for t in self.tasks]
+        return [result async for result in self]
 
-    def __aiter__(self) -> AsyncIterator[_T]:
+    async def __aiter__(self) -> AsyncIterator[_T]:
         """Return results one-by-one as they are ready"""
-        return self.tasks
+        try:
+            for future in self.futures:
+                yield await future
+        finally:
+            for future in self.futures:
+                future.cancel()
+
+            del future  # break a reference cycle with the exception
 
     async def results_generator(self) -> AsyncIterator[_T]:
         """Return results one-by-one as they are ready"""
-        async for r in self.tasks:
-            yield r
-
-           
-
-
-    
-
+        async for result in self:
+            yield result
 
 
 # NOTE: Not very many things have changed from aiomultiprocess's
@@ -209,23 +192,6 @@ class ThreadPoolResult(Awaitable[Sequence[_T]], AsyncIterable[_T]):
 class ThreadPool:
     """Execute coroutines on a pool of threads."""
 
-    # TODO: We will need to fix issues with pyright and mypy in the future...
-    @overload
-    def __init__(
-        self,
-        threads: Optional[int] = None,
-        initializer: Callable[..., None] = None,
-        initargs: Sequence[Any] = (),
-        maxtasksperchild: int = MAX_TASKS_PER_CHILD,  # Sheduled for removal in soon as a performance optimization
-        childconcurrency: int = CHILD_CONCURRENCY,
-        queuecount: Optional[int] = None,  # queuecount is not used anymore
-        scheduler: Optional[
-            Scheduler
-        ] = None,  # Scheduler is now Deprecated and no longer in use anymore
-        loop_initializer: Optional[LoopInitializer] = None,
-        exception_handler: Optional[Callable[[BaseException], None]] = None,
-    ):...
-
     @deprecated_param(
         deprecated_args=["scheduler", "maxtasksperchild"],
         version="0.1.3",
@@ -234,255 +200,161 @@ class ThreadPool:
     def __init__(
         self,
         threads: Optional[int] = None,
-        initializer: Callable[..., None] = None,
+        initializer: Optional[Callable[..., Any]] = None,
         initargs: Sequence[Any] = (),
         maxtasksperchild: int = MAX_TASKS_PER_CHILD,  # Sheduled for removal in soon as a performance optimization
         childconcurrency: int = CHILD_CONCURRENCY,
         queuecount: Optional[int] = None,  # queuecount is not used anymore
-        scheduler: Optional[
-            Scheduler
-        ] = None,  # Scheduler is now Deprecated and no longer in use anymore
+        scheduler: Optional[Scheduler] = None,  # Scheduler is now Deprecated and no longer in use anymore
         loop_initializer: Optional[LoopInitializer] = None,
         exception_handler: Optional[Callable[[BaseException], None]] = None,
     ):
-        # From concurrent.futures.ThreadPoolExecutor
-        self.thread_count = min(32, threads or ((os.cpu_count() or 1) + 4))
+        if threads is None:
+            if sys.version_info >= (3, 13):
+                cpu_count = os.process_cpu_count()
+            else:
+                cpu_count = os.cpu_count()
+
+            # From concurrent.futures.ThreadPoolExecutor
+            threads = min(32, (cpu_count or 1) + 4)
 
         self.initializer = initializer
         self.initargs = initargs
         self.loop_initializer = loop_initializer
-        self.maxtasksperchild = max(0, maxtasksperchild)
-        self.childconcurrency = max(1, childconcurrency)
+        self.maxtasksperchild = maxtasksperchild
+        self.childconcurrency = childconcurrency
         self.exception_handler = exception_handler
 
         # NOTE: Renamed processes to threads since were dealing with threads - Vizonex
 
         # Were going to use a list instead of a dicitonary for initalization
         # This is more or less an optimization
-        self.threads: list[Thread] = []
-
-        # Queue count is important to keep because of chunking
-        # Lets say we have a textfile that is 10 GB (Gigabytes)
-        # We want to go through all of them but the ram in our
-        # computer is minimal it could cause a memory-error
-
-        # So holding onto queue count is important in that case and shall not be removed.
-
-        self.queue_count = queuecount
-
-        if self.queue_count is not None:
-            if self.queue_count > self.thread_count:
-                raise ValueError("queue count must be <= thread count")
-            self.tx = Queue(self.queue_count)
-        else:
-            self.tx = SimpleQueue()
-
-        self.tasks_running = 0 
-        self.tasks_complete = REvent(True)
+        self.threads: List[ThreadPoolWorker] = []
+        self.thread_count = threads
 
         self.running = True
-        self.last_id = 0
-        # self._results: Dict[TaskID, Tuple[Any, Optional[TracebackStr]]] = {}
-
-        self.init()
-        self._loop = asyncio.get_event_loop()
-        # self._loop = asyncio.ensure_future(self.loop())
-
-
- 
 
     async def __aenter__(self) -> "ThreadPool":
         """Enable `async with ThreadPool() as pool` usage."""
         return self
 
-    async def __aexit__(self, *args) -> None:
+    async def __aexit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[TracebackType],
+    ) -> None:
         """Automatically terminate the pool when falling out of scope."""
         self.terminate()
         await self.join()
 
-    def init(self) -> None:
-        """
-        Create the initial mapping of threads and queues.
+    def _adjust_thread_count(self) -> None:
+        if len(self.threads) < self.thread_count:
+            for thread in self.threads:
+                if not thread.key():
+                    return
 
-        :meta private:
-        """
+            thread = ThreadPoolWorker(
+                SimpleQueue(),
+                self.maxtasksperchild,
+                self.childconcurrency,
+                initializer=self.initializer,
+                initargs=self.initargs,
+                loop_initializer=self.loop_initializer,
+                exception_handler=self.exception_handler,
+            )
+            thread.start()
 
-        while len(self.threads) != self.thread_count:
-            self.threads.append(self.create_worker())
-
-    def create_worker(self) -> Thread:
-        """
-        Create a worker thread attached to the given transmit and receive queues.
-
-        :meta private:
-        """
-        thread = ThreadPoolWorker(
-            self.tx,
-            self.maxtasksperchild,
-            self.childconcurrency,
-            initializer=self.initializer,
-            initargs=self.initargs,
-            loop_initializer=self.loop_initializer,
-            exception_handler=self.exception_handler,
-        )
-        thread.start()
-        return thread
+            self.threads.append(thread)
 
     def submit(
         self,
-        func: Callable[..., Awaitable[R]],
-        args: Sequence[Any],
-        kwargs: Dict[str, Any],
+        func: Callable[..., Coroutine[Any, Any, R]],
+        /,
+        *args: Any,
+        **kwargs: Any,
     ) -> asyncio.Future[R]:
-        """
-        Add a new work item to the outgoing queue.
-        returns a future
-        
-        """
+        """Run a single coroutine on the pool."""
         if not self.running:
             raise RuntimeError("pool is closed")
-        
-        def on_complete(fut):
-            self.tasks_running -= 1
-            if self.tasks_running <= 0:
-                self.tasks_complete.set()
 
+        future: Future[R] = Future()
 
-        self.tasks_complete.clear()
-        self.tasks_running += 1
+        self._adjust_thread_count()
+        min(self.threads, key=ThreadPoolWorker.key).tx.put((
+            func,
+            args,
+            kwargs,
+            future,
+        ))
 
-        self.last_id += 1
-
-        task_id = TaskID(self.last_id)
-        fut = self._loop.create_future()
-        
-        
-        fut.add_done_callback()
-
-        self.tx.put((task_id, _WorkItem(fut, self._loop, func, args, kwargs, self.exception_handler)))
-        return fut
+        return asyncio.wrap_future(future)
 
     # TODO: Deprecate apply in replacement of submit...
     async def apply(
         self,
-        func: Callable[..., Awaitable[R]],
-        args: Sequence[Any] = None,
-        kwds: Dict[str, Any] = None,
+        func: Callable[..., Coroutine[Any, Any, R]],
+        args: Optional[Sequence[Any]] = None,
+        kwds: Optional[Dict[str, Any]] = None,
     ) -> R:
         """Run a single coroutine on the pool."""
-
         if not self.running:
             raise RuntimeError("pool is closed")
-        
-        return await self.submit(func,  args or () , kwds or {})
 
+        args = args or ()
+        kwds = kwds or {}
+
+        return await self.submit(func, *args, **kwds)
 
     def map(
         self,
-        func: Callable[[T], Awaitable[R]],
+        func: Callable[[T], Coroutine[Any, Any, R]],
         iterable: Sequence[T],
-        chunksize: Optional[int] = None
     ) -> ThreadPoolResult[R]:
         """Run a coroutine once for each item in the iterable."""
         if not self.running:
             raise RuntimeError("pool is closed")
-        
-        if chunksize is None or chunksize <= 1:
-            chunksize = self.childconcurrency * self.thread_count
 
-        async def chunking():
-            nonlocal iterable
-            running = True
-            chunks = set()
-            it = iter(iterable)
-            while running:
+        futures = [self.submit(func, item) for item in iterable]
 
-                while len(chunks) < chunksize:
-                    try:
-                        chunks.add(self.submit(func, (next(it),), {}))
-                    except StopIteration:
-                        running = False
-                        break
-
-                done, _ = await asyncio.wait(chunks, timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
-                for d in done:
-                    chunks.remove(d)
-                    yield await d
-            
-            if chunks:
-                for completed in asyncio.as_completed(chunks):
-                    yield await completed
-        
-        return ThreadPoolResult(self, chunking())
-        
+        return ThreadPoolResult(futures)
 
     def starmap(
         self,
-        func: Callable[..., Awaitable[R]],
+        func: Callable[..., Coroutine[Any, Any, R]],
         iterable: Sequence[Sequence[T]],
-        chunksize: Optional[int] = None
     ) -> ThreadPoolResult[R]:
         """Run a coroutine once for each sequence of items in the iterable."""
         if not self.running:
             raise RuntimeError("pool is closed")
-        
-        if chunksize is None or chunksize <= 1:
-            chunksize = self.childconcurrency * self.thread_count
 
+        futures = [self.submit(func, *items) for items in iterable]
 
-        async def chunking():
-            nonlocal iterable
-            running = True
-            chunks = set()
-            it = iter(iterable)
-            while running:
+        return ThreadPoolResult(futures)
 
-                while len(chunks) < chunksize:
-                    try:
-                        chunks.add(self.submit(func, next(it), {}))
-                    except StopIteration:
-                        running = False
-                        break
-
-                done, _ = await asyncio.wait(chunks, timeout=0.05, return_when=asyncio.FIRST_COMPLETED)
-                for d in done:
-                    chunks.remove(d)
-                    yield await d
-            
-            if chunks:
-                for completed in asyncio.as_completed(chunks):
-                    yield await completed
-            
-        return ThreadPoolResult(self, chunking())
-    
     # TODO: Turn Close and Terminate into async functions?
     def close(self) -> None:
         """Close the pool to new visitors."""
-        self.running = False
+        if self.running:
+            self.running = False
 
-        # TODO: Better signals for stopping threads from running.
-        for t in self.threads:
-            if t.is_alive():
-                self.tx.green_put(None)
+            # TODO: Better signals for stopping threads from running.
+            for thread in self.threads:
+                if thread.is_alive():
+                    thread.tx.put(None)
 
     def terminate(self) -> None:
         """No running by the pool!"""
         if self.running:
             self.close()
 
-        for t in self.threads:
-            t.terminate()
+        for thread in self.threads:
+            thread.terminate()
 
     async def join(self) -> None:
         """Waits for the pool to be finished gracefully."""
         if self.running:
             raise RuntimeError("pool is still open")
-        
-        # wait for the futures submitted to complete...
-        await self.tasks_complete
-        
-        for t in self.threads:
-            await t
-        
 
-
+        for thread in self.threads:
+            await thread.join()
