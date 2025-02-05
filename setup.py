@@ -16,6 +16,7 @@ def main():
         version=__version__,
         packages=find_packages(),
         include_package_data=True,
+        install_requires=["aiologic"],
         description="AsyncIO version of the standard threading module",
         long_description=long_description,
         long_description_content_type="text/markdown",
