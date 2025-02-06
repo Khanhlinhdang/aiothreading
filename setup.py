@@ -1,22 +1,30 @@
-from setuptools import setup, find_packages
-from aiothreading import __version__, __author__
-import pathlib
+import re
 
+from pathlib import Path
 
+from setuptools import find_packages, setup
 
-def main():
-    try:
-        long_description = (pathlib.Path("aiothreading").parent / "readme.md").open("r").read()
-    except Exception:
-        long_description = ""
+this_directory = Path(__file__).parent
 
+__author__ = re.search(
+    r'__author__\s*=\s*"(.*?)"',
+    (this_directory / "aiothreading" / "__init__.py").read_text(),
+)[1]
+__version__ = re.search(
+    r'__version__\s*=\s*"(.*?)"',
+    (this_directory / "aiothreading" / "__version__.py").read_text(),
+)[1]
+
+long_description = (this_directory / "readme.md").read_text()
+
+if __name__ == "__main__":
     setup(
         name="aiothreading",
         author=__author__,
         version=__version__,
         packages=find_packages(),
         include_package_data=True,
-        install_requires=["aiologic"],
+        install_requires=["aiologic>=0.13.0"],
         description="AsyncIO version of the standard threading module",
         long_description=long_description,
         long_description_content_type="text/markdown",
@@ -33,7 +41,3 @@ def main():
             "Programming Language :: Python :: 3.12",
         ]
     )
-
-if __name__ == "__main__":
-    main()
-
