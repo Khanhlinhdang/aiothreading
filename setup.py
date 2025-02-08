@@ -15,7 +15,7 @@ __version__ = re.search(
     (this_directory / "aiothreading" / "__version__.py").read_text(),
 )[1]
 
-long_description = (this_directory / "readme.md").read_text()
+long_description = (this_directory / "README.md").read_text()
 
 if __name__ == "__main__":
     setup(
